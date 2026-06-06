@@ -62,6 +62,21 @@ def _is_degenerate(text: str) -> bool:
     return Counter(words).most_common(1)[0][1] > max(8, int(0.35 * len(words)))
 
 
+_REASONING_RE = re.compile(
+    r"\b(let me|wait[, ]|re-?translat|i need to|i should|i'?ll|the sentence|"
+    r"the translation|let'?s\b|actually[, ]|hmm|i think|note that|in czech|"
+    r"here is|here'?s|first,|okay[, ])", re.IGNORECASE)
+
+
+def _is_contaminated(src: str, tgt: str) -> bool:
+    """True if a Czech-target line looks like leaked LLM reasoning / meta text."""
+    if not tgt:
+        return True
+    if _REASONING_RE.search(tgt):
+        return True
+    return len(tgt) > max(80, 3 * len(src))
+
+
 def _lms(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["lms", *args], capture_output=True, text=True, check=check)
 
@@ -83,43 +98,40 @@ def unload_llm() -> None:
     _lms("unload", "--all", check=False)
 
 
-_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "translations": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {"id": {"type": "integer"}, "text": {"type": "string"}},
-                "required": ["id", "text"],
-            },
-        }
-    },
-    "required": ["translations"],
-}
+def _extract_json(text: str) -> dict:
+    """Parse the JSON object from a reply, tolerant of code fences / stray prose."""
+    text = re.sub(r"```(?:json)?", "", text)
+    i, j = text.find("{"), text.rfind("}")
+    if i < 0 or j <= i:
+        raise ValueError("no JSON object in response")
+    return json.loads(text[i:j + 1])
 
 
-def _chat(messages: list[dict], max_tokens: int = 1200, temperature: float = 0.3,
-          timeout: int = 180) -> str:
+def _chat(messages: list[dict], max_tokens: int = 16384, temperature: float = 0.3,
+          timeout: int = 600) -> str:
+    # NB: we deliberately do NOT send response_format/json_schema. For reasoning
+    # ("thinking") models LM Studio applies the schema to the thinking stream too,
+    # so the model crams its reasoning into the JSON (e.g. "wait, let me retranslate").
+    # Instead we let it think (reasoning -> reasoning_content) and read the final
+    # JSON from content after the thinking phase.
     body = {
         "model": MODEL,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "top_p": 0.9,
-        "frequency_penalty": 0.6,   # suppress repetition loops
-        "presence_penalty": 0.3,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": "translations", "schema": _SCHEMA, "strict": True},
-        },
+        "frequency_penalty": 0.4,
+        "presence_penalty": 0.2,
     }
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(API + "/chat/completions", data=data,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        resp = json.loads(r.read())
-    return resp["choices"][0]["message"]["content"]
+        msg = json.loads(r.read())["choices"][0]["message"]
+    content = (msg.get("content") or "").strip()
+    if not content:  # rare: model put everything in the reasoning stream
+        content = (msg.get("reasoning_content") or "").strip()
+    return content
 
 
 def _system_prompt(src: str, tgt: str) -> str:
@@ -141,7 +153,9 @@ def _system_prompt(src: str, tgt: str) -> str:
         f"technical terms and established anglicisms natural for the domain; match the "
         f"register and tone; keep each line roughly the same length so it fits its time "
         f"slot; never merge or split lines; translate every id exactly once.{tgt_rules} "
-        f"Return ONLY JSON matching the schema."
+        f"Each 'text' value must contain ONLY the final translated sentence — no "
+        f"reasoning, no notes, no commentary, no quotes, no English. Return ONLY JSON "
+        f"matching the schema."
     )
 
 
@@ -161,14 +175,18 @@ def translate_window(window, context, src: str, tgt: str) -> dict[int, str]:
     for attempt in range(3):
         try:
             content = _chat(messages, max_tokens=max_tokens,
-                            temperature=0.3 + 0.15 * attempt)
-            data = json.loads(content)
+                            temperature=0.2 + 0.1 * attempt)
+            data = _extract_json(content)
+            src_by_id = {s.id: s.text_src for s in window}
             out = {}
             for t in data.get("translations", []):
+                sid = int(t["id"])
                 txt = _clean_text(str(t.get("text", "")))
                 if not txt or _is_degenerate(txt):
-                    continue  # drop -> caller falls back to source text
-                out[int(t["id"])] = txt
+                    continue  # drop -> caller falls back / retries
+                if tgt == "cs" and _is_contaminated(src_by_id.get(sid, ""), txt):
+                    continue  # leaked reasoning / meta text -> reject
+                out[sid] = txt
             if out:
                 return out
             print(f"[translate] window attempt {attempt + 1}: empty/degenerate, retrying")
@@ -200,12 +218,14 @@ def polish_window(window) -> dict[int, str]:
     for attempt in range(2):
         try:
             content = _chat(messages, max_tokens=max_tokens, temperature=0.2 + 0.1 * attempt)
-            data = json.loads(content)
+            data = _extract_json(content)
+            orig = {s.id: s.text_tgt for s in window}
             out = {}
             for t in data.get("translations", []):
+                sid = int(t["id"])
                 txt = _clean_text(str(t.get("text", "")))
-                if txt and not _is_degenerate(txt):
-                    out[int(t["id"])] = txt
+                if txt and not _is_degenerate(txt) and not _is_contaminated(orig.get(sid, ""), txt):
+                    out[sid] = txt
             if out:
                 return out
         except (OSError, KeyError, ValueError) as e:
@@ -225,6 +245,8 @@ def main(argv=None) -> int:
     ap.add_argument("--host", default=None,
                     help="LM Studio base URL, e.g. http://192.168.88.111:1234 (default: local).")
     ap.add_argument("--model", default=None, help="Model id to use (default from config).")
+    ap.add_argument("--window", type=int, default=None,
+                    help="Segments per LLM batch (default: 24 remote / 8 local).")
     args = ap.parse_args(argv)
 
     workdir = Path(args.workdir)
@@ -235,12 +257,13 @@ def main(argv=None) -> int:
         print("[translate] no segments; run transcribe.py first", file=sys.stderr)
         return 2
 
-    global API, MODEL
+    global API, MODEL, WINDOW
     if args.host:
         API = args.host.rstrip("/") + "/v1"
     if args.model:
         MODEL = args.model
     remote = not any(h in API for h in ("localhost", "127.0.0.1"))
+    WINDOW = args.window or (24 if remote else 8)
 
     if remote:
         # Remote host (e.g. Mac Studio): the server JIT-loads the model itself;
@@ -279,6 +302,22 @@ def main(argv=None) -> int:
                     if seg.id in fixed:
                         seg.text_tgt = fixed[seg.id]
                 print(f"[polish] {min(i + WINDOW, len(proj.segments))}/{len(proj.segments)} lines")
+
+        # Final sweep over ALL lines: re-translate anything that still looks like
+        # leaked reasoning / meta text ("wait, let me retranslate ...").
+        if args.target == "cs":
+            bad = [s for s in proj.segments if _is_contaminated(s.text_src, s.text_tgt)]
+            for s in bad:
+                for _ in range(3):
+                    m = translate_window([s], [], src, args.target)
+                    if s.id in m:
+                        s.text_tgt = m[s.id]
+                        break
+                else:
+                    s.text_tgt = s.text_src
+            if bad:
+                print(f"[translate] contamination sweep re-did {len(bad)} line(s): "
+                      f"{[s.id for s in bad]}")
 
         for seg in proj.segments:
             seg.text_tts = (normalize_text(seg.text_tgt) if args.target == "cs"
