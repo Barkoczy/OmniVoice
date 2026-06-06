@@ -83,9 +83,11 @@ regex==2026.5.9
 requests==2.34.2
 retrying==1.4.2
 rich==15.0.0
+sacremoses==0.1.1
 safetensors==0.7.0
 scikit-learn==1.9.0
 scipy==1.17.1
+sentencepiece==0.2.1
 setuptools==70.2.0
 six==1.17.0
 sortedcontainers==2.4.0

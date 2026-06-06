@@ -197,21 +197,29 @@ def translate_window(window, context, src: str, tgt: str) -> dict[int, str]:
 
 
 _POLISH_PROMPT = (
-    "You are a meticulous Czech-language proofreader. For each line, correct ALL "
-    "grammatical errors in the Czech text: case (pády), gender/number agreement "
-    "between adjectives and nouns, the correct case after prepositions, verb "
-    "agreement (including past-tense gender per the line's speaker gender) and word "
-    "order. Do NOT translate, add, remove or rephrase content beyond fixing grammar; "
-    "preserve the meaning and the approximate length. Return ONLY JSON matching the schema."
+    "You are a meticulous Czech proofreader producing a broadcast-quality dub. For each "
+    "line, correct the grammar of 'text': case (pády), gender/number agreement, the "
+    "correct case after prepositions, verb agreement (incl. past-tense gender per the "
+    "speaker), word order, and especially the declension of proper nouns and place "
+    "names. A 'reference' field may be given (a specialized machine translation that "
+    "usually has correct Czech grammar) - use it to pick the correct forms where 'text' "
+    "is wrong, but KEEP 'text's meaning, wording and style; do not copy the reference "
+    "wholesale. If a line is already correct, return it unchanged. Return ONLY JSON "
+    "matching the schema."
 )
 
 
 def polish_window(window) -> dict[int, str]:
     """Second pass: fix Czech grammar of already-translated lines."""
-    payload = [{"id": s.id, "gender": s.gender, "text": s.text_tgt} for s in window]
-    user = ("Fix the Czech grammar of each line's text. Return JSON "
-            "{\"translations\":[{\"id\":<int>,\"text\":<str>}]} with one entry per id.\n\n"
-            + json.dumps(payload, ensure_ascii=False))
+    payload = []
+    for s in window:
+        item = {"id": s.id, "gender": s.gender, "text": s.text_tgt}
+        if s.text_nmt:
+            item["reference"] = s.text_nmt
+        payload.append(item)
+    user = ("Fix the Czech grammar of each line's 'text' (use 'reference' for the correct "
+            "forms where given). Return JSON {\"translations\":[{\"id\":<int>,\"text\":<str>}]} "
+            "with one entry per id.\n\n" + json.dumps(payload, ensure_ascii=False))
     messages = [{"role": "system", "content": _POLISH_PROMPT},
                 {"role": "user", "content": user}]
     max_tokens = min(4096, 256 + 256 * len(window))
@@ -242,6 +250,8 @@ def main(argv=None) -> int:
     ap.add_argument("--keep-loaded", action="store_true", help="Do not unload the LLM.")
     ap.add_argument("--no-polish", action="store_true",
                     help="Skip the Czech grammar-polish second pass.")
+    ap.add_argument("--polish-only", action="store_true",
+                    help="Skip translation; only re-run the grammar polish on existing text.")
     ap.add_argument("--host", default=None,
                     help="LM Studio base URL, e.g. http://192.168.88.111:1234 (default: local).")
     ap.add_argument("--model", default=None, help="Model id to use (default from config).")
@@ -275,24 +285,25 @@ def main(argv=None) -> int:
         unload_llm()  # ensure a clean VRAM slate before loading
         load_llm(ctx)
     try:
-        recent: list[str] = []
-        missed = []
-        for i in range(0, len(proj.segments), WINDOW):
-            window = proj.segments[i:i + WINDOW]
-            mapping = translate_window(window, recent[-CONTEXT_LINES:], src, args.target)
-            for seg in window:
-                if seg.id in mapping:
-                    seg.text_tgt = mapping[seg.id]
-                else:
-                    missed.append(seg)
-                recent.append(seg.text_tgt or seg.text_src)
-            print(f"[translate] {min(i + WINDOW, len(proj.segments))}/{len(proj.segments)} lines")
+        if not args.polish_only:
+            recent: list[str] = []
+            missed = []
+            for i in range(0, len(proj.segments), WINDOW):
+                window = proj.segments[i:i + WINDOW]
+                mapping = translate_window(window, recent[-CONTEXT_LINES:], src, args.target)
+                for seg in window:
+                    if seg.id in mapping:
+                        seg.text_tgt = mapping[seg.id]
+                    else:
+                        missed.append(seg)
+                    recent.append(seg.text_tgt or seg.text_src)
+                print(f"[translate] {min(i + WINDOW, len(proj.segments))}/{len(proj.segments)} lines")
 
-        # Retry any line the batch missed, one at a time, so English does not leak in.
-        for seg in missed:
-            seg.text_tgt = translate_window([seg], [], src, args.target).get(seg.id, seg.text_src)
-        if missed:
-            print(f"[translate] retried {len(missed)} missed line(s) individually")
+            # Retry any line the batch missed, one at a time, so English does not leak in.
+            for seg in missed:
+                seg.text_tgt = translate_window([seg], [], src, args.target).get(seg.id, seg.text_src)
+            if missed:
+                print(f"[translate] retried {len(missed)} missed line(s) individually")
 
         if args.target == "cs" and not args.no_polish:
             for i in range(0, len(proj.segments), WINDOW):

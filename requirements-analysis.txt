@@ -14,3 +14,5 @@
 demucs            # music/speech separation (htdemucs_ft)
 whisperx          # WhisperX large-v3 ASR + alignment + pyannote diarization
 soundfile         # audio I/O
+sentencepiece     # tokenizer for the offline NMT (Opus-MT / NLLB)
+sacremoses        # tokenizer for Opus-MT (Helsinki-NLP/opus-mt-en-cs)

@@ -40,7 +40,12 @@ def main(argv=None) -> int:
                     help="Skip the Czech grammar-polish second pass.")
     ap.add_argument("--host", default=None,
                     help="Remote LM Studio base URL for translation, e.g. http://192.168.88.111:1234")
-    ap.add_argument("--model", default=None, help="Translation model id (overrides default).")
+    ap.add_argument("--model", default=None, help="LLM translation model id (overrides default).")
+    ap.add_argument("--translator", choices=["hybrid", "nmt", "llm"], default="hybrid",
+                    help="hybrid = LLM (context) + offline NMT grammar reference (default); "
+                         "nmt = offline NMT only; llm = LLM only.")
+    ap.add_argument("--nmt-model", default=None,
+                    help="Offline NMT model id (default Helsinki-NLP/opus-mt-<src>-<tgt>).")
     args = ap.parse_args(argv)
 
     workdir = args.workdir or str(ROOT / "output" / Path(args.video).stem)
@@ -51,6 +56,7 @@ def main(argv=None) -> int:
         max_speakers=args.max_speakers, steps=steps,
         narrator=args.narrator, voices=args.voice, polish=not args.no_polish,
         host=args.host, model=args.model,
+        translator=args.translator, nmt_model=args.nmt_model,
     )
     print(f"\nPipeline finished. Work dir: {workdir}")
     return 0

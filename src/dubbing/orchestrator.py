@@ -39,7 +39,7 @@ def _run(py: Path, script: str, *args) -> None:
 def run_pipeline(video: str, workdir: str, *, source=None, target="cs",
                  separation="ensemble", min_speakers=None, max_speakers=None,
                  steps=None, narrator=None, voices=None, polish=True,
-                 host=None, model=None) -> dict:
+                 host=None, model=None, translator="nmt", nmt_model=None) -> dict:
     steps = steps or DEFAULT_STEPS
 
     if "separate" in steps:
@@ -60,14 +60,25 @@ def run_pipeline(video: str, workdir: str, *, source=None, target="cs",
         except Exception as e:  # noqa: BLE001 - secondary ASR is optional
             print(f"[orchestrator] consensus (Parakeet) skipped: {e}")
     if "translate" in steps:
-        tr_args = ["--workdir", workdir, "--target", target]
-        if not polish:
-            tr_args.append("--no-polish")
-        if host:
-            tr_args += ["--host", host]
-        if model:
-            tr_args += ["--model", model]
-        _run(VENV_TTS, "translate.py", *tr_args)
+        # nmt: offline NMT only. llm: LLM only. hybrid: NMT grammar reference + LLM
+        # (context) with NMT-aware grammar polish.
+        if translator in ("nmt", "hybrid"):
+            nmt_args = ["--workdir", workdir, "--target", target,
+                        "--field", "text_nmt" if translator == "hybrid" else "text_tgt"]
+            if source:
+                nmt_args += ["--source", source]
+            if nmt_model:
+                nmt_args += ["--model", nmt_model]
+            _run(VENV_ANALYSIS, "translate_nmt.py", *nmt_args)
+        if translator in ("llm", "hybrid"):
+            tr_args = ["--workdir", workdir, "--target", target]
+            if not polish:
+                tr_args.append("--no-polish")
+            if host:
+                tr_args += ["--host", host]
+            if model:
+                tr_args += ["--model", model]
+            _run(VENV_TTS, "translate.py", *tr_args)
     if "synth" in steps:
         synth_args = ["--workdir", workdir]
         if narrator:
