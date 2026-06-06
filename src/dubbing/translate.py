@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
@@ -27,8 +28,60 @@ from dubbing.config import (LLM_WEIGHTS_GB, LMSTUDIO_API,  # noqa: E402
 from dubbing.schema import DubProject  # noqa: E402
 from tts_service.cz_normalize import normalize_text  # noqa: E402
 
-WINDOW = 15            # segments per LLM call
+# Endpoint/model — overridable via CLI for a remote LM Studio host (e.g. a Mac Studio).
+API = LMSTUDIO_API
+MODEL = LMSTUDIO_MODEL
+
+
+def _clean_text(txt: str) -> str:
+    """Strip artifacts a model may place inside the JSON string value, e.g. a
+    leading 'text:' label or wrapping quotes ('text: "..."' -> '...')."""
+    txt = txt.strip()
+    m = re.match(r'^\s*"?text"?\s*[:=]\s*(.*)$', txt, re.IGNORECASE | re.DOTALL)
+    if m:
+        txt = m.group(1).strip()
+    if len(txt) >= 2 and txt[0] in "\"'" and txt[-1] == txt[0]:
+        txt = txt[1:-1].strip()
+    return txt
+
+WINDOW = 8             # segments per LLM call (smaller = more robust)
 CONTEXT_LINES = 3      # preceding lines passed for continuity
+
+
+def _is_degenerate(text: str) -> bool:
+    """Detect LLM repetition loops (e.g. 'společnosti společnosti společnosti ...')."""
+    words = text.split()
+    if len(words) < 12:
+        return False
+    run = 1
+    for a, b in zip(words, words[1:]):
+        run = run + 1 if a == b else 1
+        if run >= 5:
+            return True
+    from collections import Counter
+    return Counter(words).most_common(1)[0][1] > max(8, int(0.35 * len(words)))
+
+
+def _lms(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(["lms", *args], capture_output=True, text=True, check=check)
+
+
+def ensure_server() -> None:
+    try:
+        _lms("server", "start")
+    except subprocess.CalledProcessError as e:
+        print(f"[translate] lms server start: {e.stderr or e.stdout}")
+
+
+def load_llm(context_length: int) -> None:
+    print(f"[translate] loading {MODEL} (ctx={context_length}, gpu=max)")
+    _lms("load", MODEL, "--gpu", "max",
+         "--context-length", str(context_length), "--identifier", "dub-llm", "--yes")
+
+
+def unload_llm() -> None:
+    _lms("unload", "--all", check=False)
+
 
 _SCHEMA = {
     "type": "object",
@@ -46,42 +99,25 @@ _SCHEMA = {
 }
 
 
-def _lms(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["lms", *args], capture_output=True, text=True, check=check)
-
-
-def ensure_server() -> None:
-    try:
-        _lms("server", "start")
-    except subprocess.CalledProcessError as e:
-        print(f"[translate] lms server start: {e.stderr or e.stdout}")
-
-
-def load_llm(context_length: int) -> None:
-    print(f"[translate] loading {LMSTUDIO_MODEL} (ctx={context_length}, gpu=max)")
-    _lms("load", LMSTUDIO_MODEL, "--gpu", "max",
-         "--context-length", str(context_length), "--identifier", "dub-llm", "--yes")
-
-
-def unload_llm() -> None:
-    _lms("unload", "--all", check=False)
-
-
-def _chat(messages: list[dict], max_tokens: int = 3000, temperature: float = 0.2) -> str:
+def _chat(messages: list[dict], max_tokens: int = 1200, temperature: float = 0.3,
+          timeout: int = 180) -> str:
     body = {
-        "model": LMSTUDIO_MODEL,
+        "model": MODEL,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "top_p": 0.9,
+        "frequency_penalty": 0.6,   # suppress repetition loops
+        "presence_penalty": 0.3,
         "response_format": {
             "type": "json_schema",
             "json_schema": {"name": "translations", "schema": _SCHEMA, "strict": True},
         },
     }
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(LMSTUDIO_API + "/chat/completions", data=data,
+    req = urllib.request.Request(API + "/chat/completions", data=data,
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=600) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         resp = json.loads(r.read())
     return resp["choices"][0]["message"]["content"]
 
@@ -90,10 +126,13 @@ def _system_prompt(src: str, tgt: str) -> str:
     tgt_rules = ""
     if tgt == "cs":
         tgt_rules = (
-            " The target is Czech: use correct grammatical gender for past-tense "
-            "verbs and adjectives based on each line's speaker gender (male -> "
-            "'řekl/byl rád', female -> 'řekla/byla ráda'). Keep numbers as words "
-            "is NOT required here (a later step handles it)."
+            " The target is Czech. Be rigorous about Czech morphology: every "
+            "adjective must agree with its noun in case, gender and number; use the "
+            "correct case after each preposition (e.g. 'v rušném hlavním městě', NOT "
+            "'v rušné hlavní městě'; 'hlavním městem světa', NOT 'hlavní město "
+            "světa'); past-tense verbs and adjectives must agree with the speaker's "
+            "gender (male -> 'řekl/byl', female -> 'řekla/byla'). Output fluent, "
+            "grammatically flawless Czech."
         )
     return (
         f"You are a professional subtitle translator and dubbing adapter translating "
@@ -118,14 +157,60 @@ def translate_window(window, context, src: str, tgt: str) -> dict[int, str]:
             json.dumps(payload, ensure_ascii=False))
     messages = [{"role": "system", "content": _system_prompt(src, tgt)},
                 {"role": "user", "content": user}]
+    max_tokens = min(4096, 256 + 256 * len(window))
     for attempt in range(3):
         try:
-            content = _chat(messages)
+            content = _chat(messages, max_tokens=max_tokens,
+                            temperature=0.3 + 0.15 * attempt)
             data = json.loads(content)
-            return {int(t["id"]): t["text"].strip() for t in data["translations"]}
-        except (urllib.error.URLError, KeyError, json.JSONDecodeError) as e:
+            out = {}
+            for t in data.get("translations", []):
+                txt = _clean_text(str(t.get("text", "")))
+                if not txt or _is_degenerate(txt):
+                    continue  # drop -> caller falls back to source text
+                out[int(t["id"])] = txt
+            if out:
+                return out
+            print(f"[translate] window attempt {attempt + 1}: empty/degenerate, retrying")
+        except (OSError, KeyError, ValueError) as e:  # incl. TimeoutError/URLError
             print(f"[translate] window retry {attempt + 1}: {e}")
-            time.sleep(2)
+        time.sleep(1)
+    return {}
+
+
+_POLISH_PROMPT = (
+    "You are a meticulous Czech-language proofreader. For each line, correct ALL "
+    "grammatical errors in the Czech text: case (pády), gender/number agreement "
+    "between adjectives and nouns, the correct case after prepositions, verb "
+    "agreement (including past-tense gender per the line's speaker gender) and word "
+    "order. Do NOT translate, add, remove or rephrase content beyond fixing grammar; "
+    "preserve the meaning and the approximate length. Return ONLY JSON matching the schema."
+)
+
+
+def polish_window(window) -> dict[int, str]:
+    """Second pass: fix Czech grammar of already-translated lines."""
+    payload = [{"id": s.id, "gender": s.gender, "text": s.text_tgt} for s in window]
+    user = ("Fix the Czech grammar of each line's text. Return JSON "
+            "{\"translations\":[{\"id\":<int>,\"text\":<str>}]} with one entry per id.\n\n"
+            + json.dumps(payload, ensure_ascii=False))
+    messages = [{"role": "system", "content": _POLISH_PROMPT},
+                {"role": "user", "content": user}]
+    max_tokens = min(4096, 256 + 256 * len(window))
+    for attempt in range(2):
+        try:
+            content = _chat(messages, max_tokens=max_tokens, temperature=0.2 + 0.1 * attempt)
+            data = json.loads(content)
+            out = {}
+            for t in data.get("translations", []):
+                txt = _clean_text(str(t.get("text", "")))
+                if txt and not _is_degenerate(txt):
+                    out[int(t["id"])] = txt
+            if out:
+                return out
+        except (OSError, KeyError, ValueError) as e:
+            print(f"[polish] window retry {attempt + 1}: {e}")
+        time.sleep(1)
     return {}
 
 
@@ -135,6 +220,11 @@ def main(argv=None) -> int:
     ap.add_argument("--target", default="cs", help="Target language (default cs).")
     ap.add_argument("--context-length", type=int, default=None)
     ap.add_argument("--keep-loaded", action="store_true", help="Do not unload the LLM.")
+    ap.add_argument("--no-polish", action="store_true",
+                    help="Skip the Czech grammar-polish second pass.")
+    ap.add_argument("--host", default=None,
+                    help="LM Studio base URL, e.g. http://192.168.88.111:1234 (default: local).")
+    ap.add_argument("--model", default=None, help="Model id to use (default from config).")
     args = ap.parse_args(argv)
 
     workdir = Path(args.workdir)
@@ -145,21 +235,56 @@ def main(argv=None) -> int:
         print("[translate] no segments; run transcribe.py first", file=sys.stderr)
         return 2
 
-    ctx = args.context_length or vram.suggest_llm_context(LLM_WEIGHTS_GB)
-    ensure_server()
-    load_llm(ctx)
+    global API, MODEL
+    if args.host:
+        API = args.host.rstrip("/") + "/v1"
+    if args.model:
+        MODEL = args.model
+    remote = not any(h in API for h in ("localhost", "127.0.0.1"))
+
+    if remote:
+        # Remote host (e.g. Mac Studio): the server JIT-loads the model itself;
+        # we must not touch it via the local `lms` CLI.
+        print(f"[translate] remote LM Studio {API}, model={MODEL}")
+    else:
+        ctx = args.context_length or vram.suggest_llm_context(LLM_WEIGHTS_GB)
+        ensure_server()
+        unload_llm()  # ensure a clean VRAM slate before loading
+        load_llm(ctx)
     try:
         recent: list[str] = []
+        missed = []
         for i in range(0, len(proj.segments), WINDOW):
             window = proj.segments[i:i + WINDOW]
             mapping = translate_window(window, recent[-CONTEXT_LINES:], src, args.target)
             for seg in window:
-                seg.text_tgt = mapping.get(seg.id, seg.text_src)
-                seg.text_tts = normalize_text(seg.text_tgt) if args.target == "cs" else seg.text_tgt
-                recent.append(seg.text_tgt)
+                if seg.id in mapping:
+                    seg.text_tgt = mapping[seg.id]
+                else:
+                    missed.append(seg)
+                recent.append(seg.text_tgt or seg.text_src)
             print(f"[translate] {min(i + WINDOW, len(proj.segments))}/{len(proj.segments)} lines")
+
+        # Retry any line the batch missed, one at a time, so English does not leak in.
+        for seg in missed:
+            seg.text_tgt = translate_window([seg], [], src, args.target).get(seg.id, seg.text_src)
+        if missed:
+            print(f"[translate] retried {len(missed)} missed line(s) individually")
+
+        if args.target == "cs" and not args.no_polish:
+            for i in range(0, len(proj.segments), WINDOW):
+                window = proj.segments[i:i + WINDOW]
+                fixed = polish_window(window)
+                for seg in window:
+                    if seg.id in fixed:
+                        seg.text_tgt = fixed[seg.id]
+                print(f"[polish] {min(i + WINDOW, len(proj.segments))}/{len(proj.segments)} lines")
+
+        for seg in proj.segments:
+            seg.text_tts = (normalize_text(seg.text_tgt) if args.target == "cs"
+                            else seg.text_tgt)
     finally:
-        if not args.keep_loaded:
+        if not remote and not args.keep_loaded:
             unload_llm()
 
     proj.save(workdir / "project.json")

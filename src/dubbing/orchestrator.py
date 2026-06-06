@@ -38,7 +38,8 @@ def _run(py: Path, script: str, *args) -> None:
 
 def run_pipeline(video: str, workdir: str, *, source=None, target="cs",
                  separation="ensemble", min_speakers=None, max_speakers=None,
-                 steps=None) -> dict:
+                 steps=None, narrator=None, voices=None, polish=True,
+                 host=None, model=None) -> dict:
     steps = steps or DEFAULT_STEPS
 
     if "separate" in steps:
@@ -59,9 +60,21 @@ def run_pipeline(video: str, workdir: str, *, source=None, target="cs",
         except Exception as e:  # noqa: BLE001 - secondary ASR is optional
             print(f"[orchestrator] consensus (Parakeet) skipped: {e}")
     if "translate" in steps:
-        _run(VENV_TTS, "translate.py", "--workdir", workdir, "--target", target)
+        tr_args = ["--workdir", workdir, "--target", target]
+        if not polish:
+            tr_args.append("--no-polish")
+        if host:
+            tr_args += ["--host", host]
+        if model:
+            tr_args += ["--model", model]
+        _run(VENV_TTS, "translate.py", *tr_args)
     if "synth" in steps:
-        _run(VENV_TTS, "synth.py", "--workdir", workdir)
+        synth_args = ["--workdir", workdir]
+        if narrator:
+            synth_args += ["--narrator", narrator]
+        for v in (voices or []):
+            synth_args += ["--voice", v]
+        _run(VENV_TTS, "synth.py", *synth_args)
     if "assemble" in steps:
         _run(VENV_TTS, "assemble.py", "--workdir", workdir)
 

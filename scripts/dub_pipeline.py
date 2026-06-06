@@ -32,6 +32,15 @@ def main(argv=None) -> int:
     ap.add_argument("--max-speakers", type=int, default=None)
     ap.add_argument("--steps", default=None,
                     help="Comma subset of: separate,transcribe,consensus,translate,synth,assemble")
+    ap.add_argument("--narrator", default=None,
+                    help="Reference wav (3-10s) applied to ALL speakers (single-voice dub).")
+    ap.add_argument("--voice", action="append", default=[], metavar="ID=PATH",
+                    help="Per-speaker reference wav, e.g. SPEAKER_00=refs/voice.wav (repeatable).")
+    ap.add_argument("--no-polish", action="store_true",
+                    help="Skip the Czech grammar-polish second pass.")
+    ap.add_argument("--host", default=None,
+                    help="Remote LM Studio base URL for translation, e.g. http://192.168.88.111:1234")
+    ap.add_argument("--model", default=None, help="Translation model id (overrides default).")
     args = ap.parse_args(argv)
 
     workdir = args.workdir or str(ROOT / "output" / Path(args.video).stem)
@@ -40,6 +49,8 @@ def main(argv=None) -> int:
         args.video, workdir, source=args.source, target=args.target,
         separation=args.separation, min_speakers=args.min_speakers,
         max_speakers=args.max_speakers, steps=steps,
+        narrator=args.narrator, voices=args.voice, polish=not args.no_polish,
+        host=args.host, model=args.model,
     )
     print(f"\nPipeline finished. Work dir: {workdir}")
     return 0

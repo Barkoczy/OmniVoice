@@ -33,18 +33,20 @@ def used_mb(index: int = 0):
 
 
 def suggest_llm_context(weights_gb: float = 19.0, index: int = 0,
-                        reserve_mb: int = 1500, min_ctx: int = 4096,
-                        max_ctx: int = 32768) -> int:
-    """Heuristic target context length for the LLM given total VRAM.
+                        reserve_mb: int = 2000, min_ctx: int = 2048,
+                        max_ctx: int = 8192) -> int:
+    """Heuristic target context length for the LLM given FREE VRAM.
 
-    KV cache for a ~31B model is on the order of ~0.3 MB/token with LM Studio's
-    quantized cache; we keep a safety reserve. LM Studio still does its own
-    fitting at load time, so this is only a target hint.
+    Uses currently-free VRAM (so other apps' usage is accounted for) minus the
+    model weights and a safety reserve. KV cache for a ~31B model is on the order
+    of ~0.3 MB/token with LM Studio's quantized cache. The cap is deliberately
+    modest: translation windows are short, and an oversized context just forces
+    CPU offload (which is catastrophically slow). LM Studio still fits at load.
     """
-    total = total_mb(index)
-    if not total:
+    free = free_mb(index)
+    if not free:
         return min_ctx
-    budget_kv = total - int(weights_gb * 1024) - reserve_mb
+    budget_kv = free - int(weights_gb * 1024) - reserve_mb
     if budget_kv <= 0:
         return min_ctx
     ctx = int(budget_kv / 0.30)
