@@ -1,0 +1,16 @@
+# Analysis env (.venv-analysis): separation + ASR + diarization + gender.
+# Kept separate from the TTS env (.venv) so heavy deps never clash with OmniVoice.
+#
+# 1) CUDA PyTorch first (this machine: RTX 4090 / cu128):
+#      uv venv --python 3.12 .venv-analysis
+#      uv pip install --python .\.venv-analysis\Scripts\python.exe \
+#          torch==2.8.0+cu128 torchaudio==2.8.0+cu128 \
+#          --index-url https://download.pytorch.org/whl/cu128
+# 2) Then:
+#      uv pip install --python .\.venv-analysis\Scripts\python.exe -r requirements-analysis.txt
+#
+# Full pinned snapshot: requirements-analysis.lock.txt
+
+demucs            # music/speech separation (htdemucs_ft)
+whisperx          # WhisperX large-v3 ASR + alignment + pyannote diarization
+soundfile         # audio I/O

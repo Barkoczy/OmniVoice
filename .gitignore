@@ -28,3 +28,8 @@ examples/exp*
 .claude/
 *.wav
 *.jsonl
+
+# Czech dubbing pipeline
+.venv-analysis/
+output/
+refs/voices/
