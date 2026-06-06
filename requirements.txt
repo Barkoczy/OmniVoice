@@ -1,0 +1,12 @@
+# === tts-service dependencies ===
+# 1) Install CUDA PyTorch first (matches this machine: RTX 4090 / cu128):
+#      uv pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 \
+#          --index-url https://download.pytorch.org/whl/cu128
+# 2) Then install the rest:
+#      uv pip install -r requirements.txt
+#
+# A fully pinned snapshot of the known-good environment is in requirements.lock.txt
+
+omnivoice==0.1.5
+soundfile>=0.13
+transformers>=5.10   # Whisper ASR round-trip used by scripts/verify_czech.py

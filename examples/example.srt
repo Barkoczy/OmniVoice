@@ -1,0 +1,15 @@
+1
+00:00:00,000 --> 00:00:03,000
+Vítejte u ukázky českého dabingu.
+
+2
+00:00:03,500 --> 00:00:07,000
+Tento text byl vygenerován umělou inteligencí.
+
+3
+00:00:07,500 --> 00:00:11,500
+Každá věta se napasuje do svého času podle titulků.
+
+4
+00:00:12,000 --> 00:00:15,000
+Celková cena tohoto dabingu? Pouhých 0 korun.
