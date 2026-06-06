@@ -1,18 +1,17 @@
-"""Phase 3a: synthesize each line with a unique, gender-matched voice per speaker.
+"""Phase 3a: synthesize each line in the ORIGINAL speaker's voice, paced naturally.
 
-Runs in the TTS venv (OmniVoice). For every diarized speaker we ensure a
-reference voice: a user-provided clone wav if given, otherwise a distinct
-gender/pitch-varied Czech seed generated once and reused for all that speaker's
-lines (so the voice stays consistent). Each line is fitted to its subtitle slot.
+By default each diarized speaker's reference voice is extracted from the original
+separated vocals, so the dub keeps the original narrator's timbre/melody
+(cross-lingual cloning). Lines are paced into their subtitle slot by OmniVoice's
+own (natural) duration conditioning - never by external time-stretching, which
+sounded robotic - and are placed so two lines never overlap (overlapping lines
+were the "second voice" heard in the background).
 """
 
 from __future__ import annotations
 
 import argparse
-import shutil
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -23,34 +22,39 @@ from dubbing.schema import DubProject, Speaker  # noqa: E402
 from tts_service.dub import assemble_track  # noqa: E402
 from tts_service.tts import SAMPLE_RATE, CzechTTS  # noqa: E402
 
-# Distinct pitch rotation so multiple speakers of the same gender sound different.
 _PITCHES = ["moderate pitch", "low pitch", "high pitch", "very low pitch", "very high pitch"]
 _SEED_TEXT = "Dobrý den, toto je ukázka hlasu pro dabing."
 
 
-def _time_stretch(audio, factor: float):
-    """Pitch-preserving time-stretch of mono audio via ffmpeg atempo (>1 = faster).
-
-    Operates on the already-rendered (complete) audio, so no words are ever lost -
-    unlike re-synthesizing with a speed factor, which can drop or slur words.
+def extract_speaker_ref(proj, spk_id, refs_dir, lo=3.0, hi=7.0):
+    """Reference clip for a speaker from the ORIGINAL vocals: ONE clean, short
+    utterance (a multi-sentence clip makes OmniVoice echo the reference into the
+    output). Returns (wav_path, ref_text) with the exactly-aligned source text.
     """
-    if abs(factor - 1.0) < 0.02 or not shutil.which("ffmpeg"):
-        return audio
-    with tempfile.TemporaryDirectory() as td:
-        ip, op = Path(td) / "in.wav", Path(td) / "out.wav"
-        sf.write(str(ip), audio, SAMPLE_RATE)
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(ip), "-filter:a", f"atempo={factor:.4f}", str(op)],
-            check=True, capture_output=True,
-        )
-        out, _ = sf.read(str(op))
-    return np.asarray(out, dtype="float32")
+    vocals = proj.audio_vocals
+    if not vocals or not Path(vocals).exists():
+        return None, None
+    data, sr = sf.read(vocals)
+    data = np.asarray(data, dtype=np.float32)
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    cand = [s for s in proj.segments if s.speaker == spk_id and lo <= s.slot <= hi]
+    if not cand:
+        cand = [s for s in proj.segments if s.speaker == spk_id and s.slot >= 2.0]
+    if not cand:
+        return None, None
+    seg = max(cand, key=lambda s: s.slot)  # longest single utterance in range
+    clip = data[int(seg.start * sr):int(seg.end * sr)]
+    if len(clip) == 0:
+        return None, None
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    path = refs_dir / f"orig_{spk_id}.wav"
+    sf.write(str(path), clip, sr)
+    return str(path), seg.text_src.strip()
 
 
-def ensure_speaker_voice(tts: CzechTTS, spk: Speaker, idx: int, refs_dir: Path,
-                         language: str = "cs") -> None:
-    if spk.ref_voice and Path(spk.ref_voice).exists():
-        return
+def auto_voice(tts, spk, idx, refs_dir, language="cs"):
+    """Fallback: a distinct synthetic gender/pitch-varied seed voice."""
     gender = "female" if spk.gender == "female" else "male"
     instruct = f"{gender}, {_PITCHES[idx % len(_PITCHES)]}"
     audio = tts.synthesize(_SEED_TEXT, instruct=instruct, language=language,
@@ -58,24 +62,27 @@ def ensure_speaker_voice(tts: CzechTTS, spk: Speaker, idx: int, refs_dir: Path,
     refs_dir.mkdir(parents=True, exist_ok=True)
     path = refs_dir / f"voice_{spk.id}.wav"
     sf.write(str(path), audio, SAMPLE_RATE)
-    spk.ref_voice = str(path)
-    spk.ref_text = _SEED_TEXT
-    print(f"[synth] generated voice for {spk.id} ({instruct}) -> {path.name}")
+    return str(path), _SEED_TEXT
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Multi-speaker TTS fitted to slots.")
+    ap = argparse.ArgumentParser(description="Multi-speaker TTS in the original voice.")
     ap.add_argument("--workdir", required=True)
-    ap.add_argument("--num-step", type=int, default=48)
+    ap.add_argument("--num-step", type=int, default=64)
     ap.add_argument("--guidance", type=float, default=2.0)
     ap.add_argument("--narrator", default=None,
-                    help="Reference wav (3-10s) applied to ALL speakers (single voice).")
+                    help="Reference wav for ALL speakers (overrides original-voice clone).")
     ap.add_argument("--voice", action="append", default=[], metavar="ID=PATH",
-                    help="Per-speaker reference wav, e.g. SPEAKER_00=refs/narrator.wav (repeatable).")
-    ap.add_argument("--ref-text", default=None,
-                    help="Transcript of the reference(s); else Whisper auto-transcribes.")
-    ap.add_argument("--max-speed", type=float, default=1.4,
-                    help="Max speed-up used to fit a line into its slot (default 1.4).")
+                    help="Per-speaker reference wav (repeatable; overrides original clone).")
+    ap.add_argument("--ref-text", default=None, help="Transcript for --narrator/--voice refs.")
+    ap.add_argument("--auto-voice", action="store_true",
+                    help="Force synthetic voices (ignore any preset reference).")
+    ap.add_argument("--clone-original", action="store_true",
+                    help="Clone each speaker from the ORIGINAL audio (can echo a foreign "
+                         "reference into the output; off by default).")
+    ap.add_argument("--fit", action="store_true",
+                    help="Fit each line into its subtitle slot via OmniVoice duration "
+                         "(can drop word-starts; OFF by default - natural pace is reliable).")
     args = ap.parse_args(argv)
 
     workdir = Path(args.workdir)
@@ -85,45 +92,65 @@ def main(argv=None) -> int:
         return 2
 
     target = proj.target_language or "cs"
+    refs_dir = workdir / "voices"
 
-    # Apply user-provided reference voices (override auto-generation).
+    user_set = set()
     if args.narrator:
         for spk in proj.speakers.values():
             spk.ref_voice, spk.ref_text = args.narrator, args.ref_text
+            user_set.add(spk.id)
     for item in args.voice:
         sid, _, path = item.partition("=")
         if sid in proj.speakers and path:
             proj.speakers[sid].ref_voice = path
             proj.speakers[sid].ref_text = args.ref_text
-        else:
-            print(f"[synth] ignoring --voice {item!r}; known speakers: {list(proj.speakers)}")
+            user_set.add(sid)
 
     tts = CzechTTS(num_step=args.num_step, guidance_scale=args.guidance, language=target)
-    refs_dir = workdir / "voices"
 
-    for idx, spk_id in enumerate(sorted(proj.speakers)):
-        ensure_speaker_voice(tts, proj.speakers[spk_id], idx, refs_dir, target)
+    # Reference per speaker: user override > preset (e.g. a Czech sample set on the
+    # project) > clone-from-original (opt-in) > synthetic. Cloning the original is
+    # OFF by default because a foreign-language reference can echo into the output.
+    for idx, sid in enumerate(sorted(proj.speakers)):
+        spk = proj.speakers[sid]
+        if sid in user_set:
+            src = "user"
+        elif args.auto_voice:
+            spk.ref_voice, spk.ref_text = auto_voice(tts, spk, idx, refs_dir, target)
+            src = "auto"
+        elif args.clone_original:
+            rv, rt = extract_speaker_ref(proj, sid, refs_dir)
+            if rv:
+                spk.ref_voice, spk.ref_text, src = rv, rt, "original"
+            else:
+                spk.ref_voice, spk.ref_text = auto_voice(tts, spk, idx, refs_dir, target)
+                src = "auto"
+        elif spk.ref_voice and Path(spk.ref_voice).exists():
+            src = "preset"
+        else:
+            spk.ref_voice, spk.ref_text = auto_voice(tts, spk, idx, refs_dir, target)
+            src = "auto"
+        print(f"[synth] {sid} ({spk.gender}) voice={src} -> {Path(spk.ref_voice).name}")
 
     clips = []
+    prev_end = 0.0
     for seg in proj.segments:
         spk = proj.speakers.get(seg.speaker) or Speaker(id=seg.speaker)
         text = seg.text_tts or seg.text_tgt or seg.text_src
-        # Render at natural pace so the whole sentence is always spoken in full...
+        duration = seg.slot if (args.fit and seg.slot >= 1.0) else None  # natural pace by default
         audio = tts.synthesize(
             text, ref_audio=spk.ref_voice, ref_text=spk.ref_text,
-            language=target, normalize=False)
-        nat = len(audio) / SAMPLE_RATE
-        # ...then time-stretch the finished audio to fit its slot (keeps every word,
-        # pitch-preserving). Skip very short clips to avoid stretch artifacts.
-        if seg.slot >= 0.8 and nat > seg.slot * 1.05:
-            factor = min(nat / seg.slot, args.max_speed)
-            audio = _time_stretch(audio, factor)
-        clips.append((seg.start, audio))
-        print(f"[synth] seg {seg.id} {seg.speaker}/{seg.gender} @ {seg.start:.2f}s "
+            language=target, duration=duration, normalize=False)
+        start = max(seg.start, prev_end)  # never overlap the previous line
+        prev_end = start + len(audio) / SAMPLE_RATE
+        clips.append((start, audio))
+        print(f"[synth] seg {seg.id} {seg.speaker}/{seg.gender} @ {start:.2f}s "
               f"slot={seg.slot:.2f}s out={len(audio)/SAMPLE_RATE:.2f}s", flush=True)
 
     total = max(start + len(a) / SAMPLE_RATE for start, a in clips)
     track = assemble_track(clips, total)
+    peak = float(np.max(np.abs(track))) or 1.0
+    track = (track / peak) * 0.89  # consistent level, no loudnorm pumping
     out = workdir / "dubbed_vocals.wav"
     sf.write(str(out), track, SAMPLE_RATE)
     proj.save(workdir / "project.json")

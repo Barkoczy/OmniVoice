@@ -34,8 +34,7 @@ def mux_video(video: str, audio_wav: str, out_path: str) -> None:
     subprocess.run(
         ["ffmpeg", "-y", "-i", video, "-i", audio_wav,
          "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
-         "-filter:a", "loudnorm=I=-16:TP=-1.5:LRA=11",  # EBU R128 loudness normalize
-         "-c:a", "aac", "-b:a", "256k", "-shortest", out_path],
+         "-c:a", "aac", "-b:a", "256k", out_path],
         check=True, capture_output=True, text=True,
     )
 
@@ -44,7 +43,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Mix dub + music and mux to video.")
     ap.add_argument("--workdir", required=True)
     ap.add_argument("--vocals-gain", type=float, default=1.0)
-    ap.add_argument("--music-gain", type=float, default=0.85)
+    ap.add_argument("--music-gain", type=float, default=0.6)
     ap.add_argument("--out", default=None, help="Output video path.")
     args = ap.parse_args(argv)
 
