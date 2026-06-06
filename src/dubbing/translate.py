@@ -1,12 +1,14 @@
-"""Phase 2: context- and gender-aware translation via LM Studio (gemma-4-31b-qat).
+"""Phase 2: context- and gender-aware translation via any OpenAI-compatible LLM.
 
-VRAM-managed: starts the LM Studio server, loads the LLM with a context length
-computed from free VRAM, translates the transcript any -> any in sliding windows
-(so style/terminology stay consistent), then unloads the model to free VRAM for
-TTS. For a Czech target, output is additionally normalized for the TTS step.
+Provider-agnostic: the backend is configured by base URL + model + API key
+(.env or --base-url/--model/--api-key), so it works unchanged with LM Studio,
+OpenAI, Google, Mistral, Anthropic-compat, Ollama, etc. The transcript is
+translated any -> any in sliding windows (so style/terminology stay consistent);
+for a Czech target the output is additionally normalized for the TTS step.
 
-This phase only talks HTTP to LM Studio, so it does not itself hold GPU memory
-beyond what LM Studio uses for the LLM.
+When the backend is a local LM Studio (localhost), this phase also VRAM-manages it
+via the `lms` CLI (load with a context sized to free VRAM, unload afterwards to
+free VRAM for TTS). For any remote/cloud backend it only talks HTTP.
 """
 
 from __future__ import annotations
@@ -23,14 +25,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dubbing import vram  # noqa: E402
-from dubbing.config import (LLM_WEIGHTS_GB, LMSTUDIO_API,  # noqa: E402
-                            LMSTUDIO_MODEL)
+from dubbing.config import (LLM_API_KEY, LLM_BASE_URL,  # noqa: E402
+                            LLM_MODEL, LLM_WEIGHTS_GB)
 from dubbing.schema import DubProject  # noqa: E402
 from tts_service.cz_normalize import normalize_text  # noqa: E402
 
-# Endpoint/model — overridable via CLI for a remote LM Studio host (e.g. a Mac Studio).
-API = LMSTUDIO_API
-MODEL = LMSTUDIO_MODEL
+# Backend endpoint/model/key — provider-agnostic (OpenAI-compatible). Overridable via
+# CLI (--base-url/--model/--api-key) or .env, so the LLM can be LM Studio, OpenAI,
+# Google, Mistral, Anthropic-compat, Ollama, ... without any code change.
+BASE_URL = LLM_BASE_URL
+MODEL = LLM_MODEL
+API_KEY = LLM_API_KEY
 
 
 def _clean_text(txt: str) -> str:
@@ -44,8 +49,12 @@ def _clean_text(txt: str) -> str:
         txt = txt[1:-1].strip()
     return txt
 
-WINDOW = 8             # segments per LLM call (smaller = more robust)
+WINDOW = 50            # segments per LLM call; the host's large context makes big
+                       # batches efficient (few requests) and the budget below stops
+                       # the JSON ever truncating
 CONTEXT_LINES = 3      # preceding lines passed for continuity
+MAX_TOKENS = 36864     # completion budget per call: comfortably fits the thinking
+                       # phase + the full JSON answer (host context is 256k)
 
 
 def _is_degenerate(text: str) -> bool:
@@ -107,13 +116,33 @@ def _extract_json(text: str) -> dict:
     return json.loads(text[i:j + 1])
 
 
+_OBJECT_RE = re.compile(r'\{[^{}]*?"id"\s*:\s*\d+[^{}]*?\}', re.DOTALL)
+
+
+def _salvage_objects(text: str) -> list[dict]:
+    """Best-effort recovery when the whole reply is not valid JSON (e.g. the array
+    was truncated by the token budget). Returns every COMPLETE {id,text} object we
+    can still parse, so a partial window keeps its finished lines instead of losing
+    all of them."""
+    text = re.sub(r"```(?:json)?", "", text)
+    out = []
+    for m in _OBJECT_RE.finditer(text):
+        try:
+            obj = json.loads(m.group(0))
+        except ValueError:
+            continue
+        if "id" in obj and "text" in obj:
+            out.append(obj)
+    return out
+
+
 def _chat(messages: list[dict], max_tokens: int = 16384, temperature: float = 0.3,
           timeout: int = 600) -> str:
-    # NB: we deliberately do NOT send response_format/json_schema. For reasoning
-    # ("thinking") models LM Studio applies the schema to the thinking stream too,
-    # so the model crams its reasoning into the JSON (e.g. "wait, let me retranslate").
-    # Instead we let it think (reasoning -> reasoning_content) and read the final
-    # JSON from content after the thinking phase.
+    # NB: we deliberately do NOT send response_format/json_schema. On reasoning
+    # ("thinking") models that constraint is applied to the thinking stream too, which
+    # both leaks reasoning into the JSON and suppresses thinking (verified against the
+    # backend: it empties reasoning_content). Instead we keep thinking ON and read the
+    # final JSON from `content` after the thinking phase.
     body = {
         "model": MODEL,
         "messages": messages,
@@ -123,15 +152,19 @@ def _chat(messages: list[dict], max_tokens: int = 16384, temperature: float = 0.
         "frequency_penalty": 0.4,
         "presence_penalty": 0.2,
     }
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(API + "/chat/completions", data=data,
-                                 headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(BASE_URL.rstrip("/") + "/chat/completions",
+                                 data=data, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         msg = json.loads(r.read())["choices"][0]["message"]
-    content = (msg.get("content") or "").strip()
-    if not content:  # rare: model put everything in the reasoning stream
-        content = (msg.get("reasoning_content") or "").strip()
-    return content
+    # Use ONLY the final answer (`content`) produced AFTER the thinking phase, never
+    # the `reasoning_content` stream. Thinking stays ON (it improves the translation);
+    # we just read the finished JSON. Empty content means the token budget was eaten
+    # by the thinking phase -> the caller retries with a larger budget.
+    return (msg.get("content") or "").strip()
 
 
 def _system_prompt(src: str, tgt: str) -> str:
@@ -171,16 +204,24 @@ def translate_window(window, context, src: str, tgt: str) -> dict[int, str]:
             json.dumps(payload, ensure_ascii=False))
     messages = [{"role": "system", "content": _system_prompt(src, tgt)},
                 {"role": "user", "content": user}]
-    max_tokens = min(4096, 256 + 256 * len(window))
+    # Fixed generous budget (MAX_TOKENS) so the thinking phase AND the full JSON
+    # answer both fit; too small a budget truncates the JSON mid-array.
+    max_tokens = MAX_TOKENS
+    src_by_id = {s.id: s.text_src for s in window}
     for attempt in range(3):
         try:
             content = _chat(messages, max_tokens=max_tokens,
                             temperature=0.2 + 0.1 * attempt)
-            data = _extract_json(content)
-            src_by_id = {s.id: s.text_src for s in window}
+            try:
+                items = _extract_json(content).get("translations", [])
+            except ValueError:
+                items = _salvage_objects(content)  # truncated/malformed -> keep what parsed
             out = {}
-            for t in data.get("translations", []):
-                sid = int(t["id"])
+            for t in items:
+                try:
+                    sid = int(t["id"])
+                except (KeyError, ValueError, TypeError):
+                    continue
                 txt = _clean_text(str(t.get("text", "")))
                 if not txt or _is_degenerate(txt):
                     continue  # drop -> caller falls back / retries
@@ -190,7 +231,7 @@ def translate_window(window, context, src: str, tgt: str) -> dict[int, str]:
             if out:
                 return out
             print(f"[translate] window attempt {attempt + 1}: empty/degenerate, retrying")
-        except (OSError, KeyError, ValueError) as e:  # incl. TimeoutError/URLError
+        except OSError as e:  # incl. TimeoutError / URLError
             print(f"[translate] window retry {attempt + 1}: {e}")
         time.sleep(1)
     return {}
@@ -222,28 +263,35 @@ def polish_window(window) -> dict[int, str]:
             "with one entry per id.\n\n" + json.dumps(payload, ensure_ascii=False))
     messages = [{"role": "system", "content": _POLISH_PROMPT},
                 {"role": "user", "content": user}]
-    max_tokens = min(4096, 256 + 256 * len(window))
+    max_tokens = MAX_TOKENS
+    orig = {s.id: s.text_tgt for s in window}
     for attempt in range(2):
         try:
             content = _chat(messages, max_tokens=max_tokens, temperature=0.2 + 0.1 * attempt)
-            data = _extract_json(content)
-            orig = {s.id: s.text_tgt for s in window}
+            try:
+                items = _extract_json(content).get("translations", [])
+            except ValueError:
+                items = _salvage_objects(content)
             out = {}
-            for t in data.get("translations", []):
-                sid = int(t["id"])
+            for t in items:
+                try:
+                    sid = int(t["id"])
+                except (KeyError, ValueError, TypeError):
+                    continue
                 txt = _clean_text(str(t.get("text", "")))
                 if txt and not _is_degenerate(txt) and not _is_contaminated(orig.get(sid, ""), txt):
                     out[sid] = txt
             if out:
                 return out
-        except (OSError, KeyError, ValueError) as e:
+        except OSError as e:
             print(f"[polish] window retry {attempt + 1}: {e}")
         time.sleep(1)
     return {}
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Translate transcript via LM Studio.")
+    ap = argparse.ArgumentParser(
+        description="Translate transcript via an OpenAI-compatible LLM backend.")
     ap.add_argument("--workdir", required=True)
     ap.add_argument("--target", default="cs", help="Target language (default cs).")
     ap.add_argument("--context-length", type=int, default=None)
@@ -252,11 +300,16 @@ def main(argv=None) -> int:
                     help="Skip the Czech grammar-polish second pass.")
     ap.add_argument("--polish-only", action="store_true",
                     help="Skip translation; only re-run the grammar polish on existing text.")
-    ap.add_argument("--host", default=None,
-                    help="LM Studio base URL, e.g. http://192.168.88.111:1234 (default: local).")
-    ap.add_argument("--model", default=None, help="Model id to use (default from config).")
+    ap.add_argument("--base-url", default=None,
+                    help="OpenAI-compatible base URL ending in /v1, e.g. "
+                         "http://192.168.88.111:1234/v1 or https://api.openai.com/v1 "
+                         "(default from LLM_BASE_URL / .env).")
+    ap.add_argument("--api-key", default=None,
+                    help="Bearer API key for the backend (default from LLM_API_KEY / .env; "
+                         "empty for a local LM Studio).")
+    ap.add_argument("--model", default=None, help="Model id (default from LLM_MODEL / .env).")
     ap.add_argument("--window", type=int, default=None,
-                    help="Segments per LLM batch (default: 24 remote / 8 local).")
+                    help="Segments per LLM batch (default from config).")
     args = ap.parse_args(argv)
 
     workdir = Path(args.workdir)
@@ -267,23 +320,26 @@ def main(argv=None) -> int:
         print("[translate] no segments; run transcribe.py first", file=sys.stderr)
         return 2
 
-    global API, MODEL, WINDOW
-    if args.host:
-        API = args.host.rstrip("/") + "/v1"
+    global BASE_URL, MODEL, API_KEY, WINDOW
+    if args.base_url:
+        BASE_URL = args.base_url
     if args.model:
         MODEL = args.model
-    remote = not any(h in API for h in ("localhost", "127.0.0.1"))
-    WINDOW = args.window or (24 if remote else 8)
+    if args.api_key is not None:
+        API_KEY = args.api_key
+    if args.window:
+        WINDOW = args.window
+    # Only a local LM Studio is VRAM-managed via the `lms` CLI; any remote/cloud
+    # backend is used over plain HTTP.
+    manage_local = any(h in BASE_URL for h in ("localhost", "127.0.0.1"))
 
-    if remote:
-        # Remote host (e.g. Mac Studio): the server JIT-loads the model itself;
-        # we must not touch it via the local `lms` CLI.
-        print(f"[translate] remote LM Studio {API}, model={MODEL}")
-    else:
+    if manage_local:
         ctx = args.context_length or vram.suggest_llm_context(LLM_WEIGHTS_GB)
         ensure_server()
         unload_llm()  # ensure a clean VRAM slate before loading
         load_llm(ctx)
+    else:
+        print(f"[translate] backend {BASE_URL}, model={MODEL}")
     try:
         if not args.polish_only:
             recent: list[str] = []
@@ -298,11 +354,16 @@ def main(argv=None) -> int:
                         missed.append(seg)
                     recent.append(seg.text_tgt or seg.text_src)
                 print(f"[translate] {min(i + WINDOW, len(proj.segments))}/{len(proj.segments)} lines")
+                if i % (WINDOW * 5) == 0:
+                    proj.save(workdir / "project.json")  # checkpoint: never lose progress
 
-            # Retry any line the batch missed, one at a time, so English does not leak in.
+            # Retry any line the batch missed, one at a time (bounded). On final
+            # failure fall back to the offline NMT line if we have one, else source.
             for seg in missed:
-                seg.text_tgt = translate_window([seg], [], src, args.target).get(seg.id, seg.text_src)
+                m = translate_window([seg], [], src, args.target)
+                seg.text_tgt = m.get(seg.id) or seg.text_nmt or seg.text_src
             if missed:
+                proj.save(workdir / "project.json")
                 print(f"[translate] retried {len(missed)} missed line(s) individually")
 
         if args.target == "cs" and not args.no_polish:
@@ -313,19 +374,21 @@ def main(argv=None) -> int:
                     if seg.id in fixed:
                         seg.text_tgt = fixed[seg.id]
                 print(f"[polish] {min(i + WINDOW, len(proj.segments))}/{len(proj.segments)} lines")
+                if i % (WINDOW * 5) == 0:
+                    proj.save(workdir / "project.json")
 
         # Final sweep over ALL lines: re-translate anything that still looks like
         # leaked reasoning / meta text ("wait, let me retranslate ...").
         if args.target == "cs":
             bad = [s for s in proj.segments if _is_contaminated(s.text_src, s.text_tgt)]
             for s in bad:
-                for _ in range(3):
+                for _ in range(2):
                     m = translate_window([s], [], src, args.target)
                     if s.id in m:
                         s.text_tgt = m[s.id]
                         break
                 else:
-                    s.text_tgt = s.text_src
+                    s.text_tgt = s.text_nmt or s.text_src  # prefer offline NMT over source
             if bad:
                 print(f"[translate] contamination sweep re-did {len(bad)} line(s): "
                       f"{[s.id for s in bad]}")
@@ -334,7 +397,7 @@ def main(argv=None) -> int:
             seg.text_tts = (normalize_text(seg.text_tgt) if args.target == "cs"
                             else seg.text_tgt)
     finally:
-        if not remote and not args.keep_loaded:
+        if manage_local and not args.keep_loaded:
             unload_llm()
 
     proj.save(workdir / "project.json")

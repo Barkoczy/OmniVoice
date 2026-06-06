@@ -38,8 +38,10 @@ def main(argv=None) -> int:
                     help="Per-speaker reference wav, e.g. SPEAKER_00=refs/voice.wav (repeatable).")
     ap.add_argument("--no-polish", action="store_true",
                     help="Skip the Czech grammar-polish second pass.")
-    ap.add_argument("--host", default=None,
-                    help="Remote LM Studio base URL for translation, e.g. http://192.168.88.111:1234")
+    ap.add_argument("--base-url", default=None,
+                    help="OpenAI-compatible LLM base URL ending in /v1 (default from .env).")
+    ap.add_argument("--api-key", default=None,
+                    help="Bearer API key for the LLM backend (default from .env).")
     ap.add_argument("--model", default=None, help="LLM translation model id (overrides default).")
     ap.add_argument("--translator", choices=["hybrid", "nmt", "llm"], default="hybrid",
                     help="hybrid = LLM (context) + offline NMT grammar reference (default); "
@@ -55,7 +57,7 @@ def main(argv=None) -> int:
         separation=args.separation, min_speakers=args.min_speakers,
         max_speakers=args.max_speakers, steps=steps,
         narrator=args.narrator, voices=args.voice, polish=not args.no_polish,
-        host=args.host, model=args.model,
+        base_url=args.base_url, api_key=args.api_key, model=args.model,
         translator=args.translator, nmt_model=args.nmt_model,
     )
     print(f"\nPipeline finished. Work dir: {workdir}")

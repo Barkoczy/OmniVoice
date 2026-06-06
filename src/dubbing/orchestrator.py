@@ -39,7 +39,8 @@ def _run(py: Path, script: str, *args) -> None:
 def run_pipeline(video: str, workdir: str, *, source=None, target="cs",
                  separation="ensemble", min_speakers=None, max_speakers=None,
                  steps=None, narrator=None, voices=None, polish=True,
-                 host=None, model=None, translator="nmt", nmt_model=None) -> dict:
+                 base_url=None, api_key=None, model=None, translator="nmt",
+                 nmt_model=None) -> dict:
     steps = steps or DEFAULT_STEPS
 
     if "separate" in steps:
@@ -74,8 +75,10 @@ def run_pipeline(video: str, workdir: str, *, source=None, target="cs",
             tr_args = ["--workdir", workdir, "--target", target]
             if not polish:
                 tr_args.append("--no-polish")
-            if host:
-                tr_args += ["--host", host]
+            if base_url:
+                tr_args += ["--base-url", base_url]
+            if api_key:
+                tr_args += ["--api-key", api_key]
             if model:
                 tr_args += ["--model", model]
             _run(VENV_TTS, "translate.py", *tr_args)
