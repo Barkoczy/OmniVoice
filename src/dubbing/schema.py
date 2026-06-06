@@ -13,7 +13,9 @@ class Segment:
     id: int
     start: float
     end: float
-    text_src: str = ""          # original transcription
+    text_src: str = ""          # original transcription (primary ASR: WhisperX)
+    text_asr2: str = ""         # secondary ASR (Parakeet) for the same span
+    asr_agreement: float = 1.0  # 0..1 similarity between the two ASR outputs
     text_tgt: str = ""          # translation (target language)
     text_tts: str = ""          # translation normalized for TTS
     speaker: str = "SPEAKER_00"

@@ -31,7 +31,7 @@ def main(argv=None) -> int:
     ap.add_argument("--min-speakers", type=int, default=None)
     ap.add_argument("--max-speakers", type=int, default=None)
     ap.add_argument("--steps", default=None,
-                    help="Comma list subset of: separate,transcribe,translate,synth,assemble")
+                    help="Comma subset of: separate,transcribe,consensus,translate,synth,assemble")
     args = ap.parse_args(argv)
 
     workdir = args.workdir or str(ROOT / "output" / Path(args.video).stem)

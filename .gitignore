@@ -30,6 +30,6 @@ examples/exp*
 *.jsonl
 
 # Czech dubbing pipeline
-.venv-analysis/
+.venv-*/
 output/
 refs/voices/

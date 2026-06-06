@@ -21,7 +21,8 @@ import numpy as np
 import soundfile as sf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dubbing.config import DEMUCS_MODEL, ROFORMER_MODEL, SEP_SR  # noqa: E402
+from dubbing.config import (DEMUCS_MODEL, ROFORMER_MODEL, SEP_SR,  # noqa: E402
+                            VENV_ROFORMER)
 from dubbing.schema import DubProject  # noqa: E402
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".flv", ".ts"}
@@ -54,23 +55,29 @@ def separate_demucs(in_wav: Path, outdir: Path, device: str = "cuda"
 
 
 def separate_roformer(in_wav: Path, outdir: Path) -> tuple[np.ndarray, np.ndarray, int] | None:
-    """Return (vocals, instrumental, sr) using UVR BS-Roformer, or None if unavailable."""
+    """Return (vocals, instrumental, sr) via the roformer subprocess, or None.
+
+    Runs in the isolated .venv-roformer; degrades gracefully (returns None, so the
+    ensemble falls back to Demucs alone) if that env or the model is unavailable.
+    """
+    rof_out = outdir / "_roformer"
+    rof_out.mkdir(parents=True, exist_ok=True)
+    script = Path(__file__).resolve().parent / "roformer.py"
     try:
-        from audio_separator.separator import Separator as AudioSep
-    except ImportError:
+        subprocess.run(
+            [str(VENV_ROFORMER), str(script), "--input", str(in_wav),
+             "--outdir", str(rof_out), "--model", ROFORMER_MODEL],
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
+        print(f"[separate] roformer unavailable ({e}); using Demucs only")
         return None
-    outdir.mkdir(parents=True, exist_ok=True)
-    sep = AudioSep(output_dir=str(outdir))
-    sep.load_model(model_filename=ROFORMER_MODEL)
-    outputs = sep.separate(str(in_wav))  # list of produced file paths
-    voc = next((p for p in outputs if "vocal" in p.lower()), None)
-    inst = next((p for p in outputs if "instrument" in p.lower()
-                 or "no_vocal" in p.lower() or "accompaniment" in p.lower()), None)
-    if not voc or not inst:
+    voc, inst = rof_out / "vocals.wav", rof_out / "instrumental.wav"
+    if not voc.exists() or not inst.exists():
         return None
-    v, sr = sf.read(str(outdir / voc) if not Path(voc).is_absolute() else voc)
-    i, _ = sf.read(str(outdir / inst) if not Path(inst).is_absolute() else inst)
-    return np.asarray(v), np.asarray(i), int(sr)
+    v, sr = sf.read(str(voc))
+    i, _ = sf.read(str(inst))
+    return np.asarray(v, dtype=np.float32), np.asarray(i, dtype=np.float32), int(sr)
 
 
 def _align_mean(arrays: list[np.ndarray]) -> np.ndarray:

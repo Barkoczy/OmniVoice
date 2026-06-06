@@ -1,0 +1,7 @@
+# Roformer env (.venv-roformer): UVR BS-Roformer separation via audio-separator.
+# Install CUDA torch first (see requirements-analysis.txt header), then:
+#   uv pip install --python .\.venv-roformer\Scripts\python.exe -r requirements-roformer.txt
+# Full pinned snapshot: requirements-roformer.lock.txt
+
+audio-separator[gpu]
+soundfile

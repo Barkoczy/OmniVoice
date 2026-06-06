@@ -13,7 +13,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dubbing.config import ROOT, VENV_ANALYSIS, VENV_TTS  # noqa: E402
+from dubbing.config import (ROOT, VENV_ANALYSIS, VENV_PARAKEET,  # noqa: E402
+                            VENV_TTS)
 
 SRC = ROOT / "src" / "dubbing"
 
@@ -21,11 +22,12 @@ SRC = ROOT / "src" / "dubbing"
 PHASES = {
     "separate": (VENV_ANALYSIS, "separate.py"),
     "transcribe": (VENV_ANALYSIS, "transcribe.py"),
+    "consensus": (VENV_PARAKEET, "parakeet.py"),
     "translate": (VENV_TTS, "translate.py"),
     "synth": (VENV_TTS, "synth.py"),
     "assemble": (VENV_TTS, "assemble.py"),
 }
-DEFAULT_STEPS = ["separate", "transcribe", "translate", "synth", "assemble"]
+DEFAULT_STEPS = ["separate", "transcribe", "consensus", "translate", "synth", "assemble"]
 
 
 def _run(py: Path, script: str, *args) -> None:
@@ -51,6 +53,11 @@ def run_pipeline(video: str, workdir: str, *, source=None, target="cs",
         if max_speakers:
             args += ["--max-speakers", max_speakers]
         _run(VENV_ANALYSIS, "transcribe.py", *args)
+    if "consensus" in steps:
+        try:
+            _run(VENV_PARAKEET, "parakeet.py", "--workdir", workdir)
+        except Exception as e:  # noqa: BLE001 - secondary ASR is optional
+            print(f"[orchestrator] consensus (Parakeet) skipped: {e}")
     if "translate" in steps:
         _run(VENV_TTS, "translate.py", "--workdir", workdir, "--target", target)
     if "synth" in steps:

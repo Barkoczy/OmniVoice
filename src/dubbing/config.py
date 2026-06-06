@@ -9,7 +9,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # Per-phase Python interpreters (subprocess-per-phase keeps VRAM isolated).
 VENV_TTS = ROOT / ".venv" / "Scripts" / "python.exe"            # OmniVoice
-VENV_ANALYSIS = ROOT / ".venv-analysis" / "Scripts" / "python.exe"  # ASR/separation/diarization
+VENV_ANALYSIS = ROOT / ".venv-analysis" / "Scripts" / "python.exe"  # WhisperX/Demucs/diarization
+VENV_ROFORMER = ROOT / ".venv-roformer" / "Scripts" / "python.exe"  # UVR BS-Roformer (audio-separator)
+VENV_PARAKEET = ROOT / ".venv-parakeet" / "Scripts" / "python.exe"  # NVIDIA Parakeet (NeMo)
 
 # Models
 DEMUCS_MODEL = "htdemucs_ft"
