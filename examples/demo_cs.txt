@@ -1,0 +1,1 @@
+Dobrý den a vítejte. Toto je ukázka českého převodu textu na řeč pomocí modelu OmniVoice, který běží lokálně na grafické kartě RTX 4090. Model zvládá diakritiku, háčky i čárky, a dokáže správně přečíst čísla, například 1 234 korun, 25 procent nebo teplotu 21 stupňů Celsia. Schůzka začíná ve 14:30 a potrvá 2 hodiny.

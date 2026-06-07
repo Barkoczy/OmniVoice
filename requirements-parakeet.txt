@@ -1,0 +1,7 @@
+# Parakeet env (.venv-parakeet): NVIDIA Parakeet-TDT v3 (secondary ASR) via NeMo.
+# Install CUDA torch first (see requirements-analysis.txt header), then:
+#   uv pip install --python .\.venv-parakeet\Scripts\python.exe -r requirements-parakeet.txt
+# Full pinned snapshot: requirements-parakeet.lock.txt
+
+nemo_toolkit[asr]
+soundfile
